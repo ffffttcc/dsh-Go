@@ -28,6 +28,12 @@ jobs:
           SYSTEM_IMAGE: platform-tools
         run: bash tooling/setup-toolchain.sh
 
+      - name: Runtime bundle (arm64)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xz-utils gpgv
+          bash runtime/build-runtime.sh arm64-v8a
+
       - name: Build arm64 release
         run: |
           source tooling/env.sh
