@@ -13,6 +13,7 @@ import 'state/appearance_state.dart';
 import 'state/locale_state.dart';
 import 'state/star_prompt.dart' show starPromptGateProvider, starPromptProvider;
 import 'state/tile_style_state.dart';
+import 'state/turn_signals_state.dart';
 import 'ui/chat/dsh_ui/dsh_ui_model.dart' show DshUiAppAccent;
 import 'ui/common/side_insets.dart';
 import 'ui/launch/launch_overlay.dart';
@@ -63,6 +64,8 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     if (ref.read(starPromptGateProvider)) ref.read(starPromptProvider);
     // 伙伴小屋: her invitation ledger is read now, so it is known before the room opens.
     ref.read(companionInitiativeProvider);
+    // 省电: turn activity for the idle stop of the local engine, from launch on.
+    ref.read(turnSignalsProvider);
     // 刷新率: some systems cap third-party apps at 60 Hz and then show their per-app
     // switch as an in-app setting; the app answers frames to run at the fastest rate
     // while it is actually drawing (see RefreshRateService).

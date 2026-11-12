@@ -31,6 +31,13 @@ class DshService : Service() {
     private var installSink: RuntimeController.EventSink? = null
     private var installPercent = -1
     private var installUpgrade = false
+    private val idleHandler = Handler(Looper.getMainLooper())
+    private val idleRunnable = Runnable { onIdleElapsed() }
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -97,6 +104,7 @@ class DshService : Service() {
                 foreground(notification)
                 running = true
                 acquireWakeLock()
+                armIdle("start")
                 registerNetworkCallback(controller)
                 logBackgroundPolicy(controller)
                 controller.startProcess()
@@ -107,17 +115,22 @@ class DshService : Service() {
 
     override fun onDestroy() {
         running = false
-        installSink?.let { RuntimeController.get(this).removeSink(it) }
+        instance = null
+        disarmIdle()
+        // First, before anything below can throw: a throw used to skip the release entirely and
+        // leave the CPU awake until the process died (measured: 7h02m held in one battery cycle).
+        releaseWakeLock()
+        runCatching { installSink?.let { RuntimeController.get(this).removeSink(it) } }
         installSink = null
-        networkWatch?.let { RuntimeController.get(this).onNetworkWatchStopped(it) }
+        runCatching { networkWatch?.let { RuntimeController.get(this).onNetworkWatchStopped(it) } }
         networkWatch = null
-        networkCallback?.let { callback ->
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            runCatching { cm.unregisterNetworkCallback(callback) }
+        runCatching {
+            networkCallback?.let { callback ->
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                cm.unregisterNetworkCallback(callback)
+            }
         }
         networkCallback = null
-        wakeLock?.let { if (it.isHeld) it.release() }
-        wakeLock = null
         super.onDestroy()
     }
 
@@ -173,6 +186,69 @@ class DshService : Service() {
             setReferenceCounted(false)
             acquire()
         }
+    }
+
+    /**
+     * The task was swiped away. Stop through the normal generation-checked path instead of
+     * letting the system kill the service: killing it here would orphan the proot engine (no
+     * notification, no lock) and count as an unexpected exit, which disables auto-start after
+     * two strikes.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val controller = RuntimeController.get(this)
+        if (controller.phase == RuntimeController.Phase.RUNNING) controller.stop()
+        super.onTaskRemoved(rootIntent)
+    }
+
+    private fun releaseWakeLock() {
+        val lock = wakeLock ?: return
+        wakeLock = null
+        runCatching { if (lock.isHeld) lock.release() }
+    }
+
+    /** Push the idle deadline out. Called on every sign of life: start, status change, engine event. */
+    private fun armIdle(reason: String) {
+        idleHandler.removeCallbacks(idleRunnable)
+        idleHandler.postDelayed(idleRunnable, idleDelayMs())
+    }
+
+    private fun disarmIdle() = idleHandler.removeCallbacks(idleRunnable)
+
+    /** Until the engine reports per-session turn state (M2), guess nothing: use the long window. */
+    private fun idleDelayMs(): Long = if (TurnSignals.available) IDLE_STOP_MS else IDLE_FALLBACK_MS
+
+    /** A report older than two windows is not knowledge: the Dart side may have been reclaimed. */
+    private fun signalFresh(): Boolean {
+        if (!TurnSignals.available || !TurnSignals.settled) return false
+        return System.currentTimeMillis() - TurnSignals.lastReportMs < 2 * IDLE_STOP_MS
+    }
+
+    private fun onIdleElapsed() {
+        val controller = RuntimeController.get(this)
+        if (!running || controller.phase != RuntimeController.Phase.RUNNING) return
+        if (MainActivity.inForeground) { onActivity(); return }
+        // Quiet is not idle: a running turn, a handoff or approval card, or the phone in use.
+        if (TurnSignals.pendingWait || TurnSignals.activeTurns > 0) { onActivity(); return }
+        if (PhoneControl.peek()?.liveTask() != null) { onActivity(); return }
+        // We do not know what the engine is doing (no signal, or a stale one). The service may
+        // stay, but the CPU must get its rest: drop the lock and keep watching.
+        if (!signalFresh() && !TurnSignals.stopWithoutSignal) { sleepAndKeepService(); return }
+        if (!controller.stopForIdle()) { onActivity(); return }
+        stopForegroundCompat()
+        stopSelf()
+    }
+
+    /** Release the CPU but keep the foreground service: the next sign of life takes it back. */
+    private fun sleepAndKeepService() {
+        releaseWakeLock()
+        idleHandler.removeCallbacks(idleRunnable)
+        idleHandler.postDelayed(idleRunnable, idleDelayMs())
+    }
+
+    /** A sign of life: hold the CPU again (it may have been given up while idle) and re-arm. */
+    private fun onActivity() {
+        acquireWakeLock()
+        armIdle("activity")
     }
 
     private fun stopForegroundCompat() {
@@ -294,6 +370,16 @@ class DshService : Service() {
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.notify(NOTIFICATION_ID, buildNotification(context, RuntimeController.get(context)))
         }
+
+        @Volatile private var instance: DshService? = null
+
+        /** Any engine or UI activity: push the idle deadline out. No intent, no binder. */
+        fun touch() {
+            runCatching { instance?.onActivity() }
+        }
+
+        private const val IDLE_STOP_MS = 3 * 60_000L
+        private const val IDLE_FALLBACK_MS = 15 * 60_000L
 
         fun stopSelfIfRunning(context: Context, generation: Int) {
             if (running) context.startService(Intent(context, DshService::class.java).setAction(ACTION_STOP)

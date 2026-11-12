@@ -246,6 +246,9 @@ class RuntimeController private constructor(private val app: Context) : DshProce
         }
     }
 
+    /** A [start] that arrived while a stop was still landing; replayed once it settles. */
+    @Volatile private var pendingRestart = false
+
     /**
      * Starts the foreground service, which calls [startProcess]. [mode] is "safe", "normal"
      * (leaving safe mode starts a two-minute trial) or null to keep the current mode.
@@ -259,6 +262,15 @@ class RuntimeController private constructor(private val app: Context) : DshProce
         pendingPhoneStorage = phoneStorage
         pendingVisualReplies = visualReplies
         if (phase == Phase.RUNNING || phase == Phase.STARTING) return
+        // A stop is still in flight: remember this start and replay it when the process is gone.
+        // Racing it instead starts the service, which takes the wakelock, while startProcess
+        // returns at once on STOPPING — the lock then has no owner (measured 67 min / 5 cold
+        // starts, shortest gap 13 s).
+        if (phase == Phase.STOPPING) {
+            pendingEnv = env
+            pendingRestart = true
+            return
+        }
         pendingEnv = env
         val next = SafePolicy.onStartRequest(safeState, mode)
         if (next != safeState) {
@@ -284,8 +296,36 @@ class RuntimeController private constructor(private val app: Context) : DshProce
         null
     }
 
+    /** Replay a start that arrived during a stop, now that the process is gone. */
+    private fun replayPendingStart() {
+        if (!pendingRestart) return
+        pendingRestart = false
+        // setPhase runs on worker threads and inside the @Synchronized stop path; starting a
+        // foreground service there throws ForegroundServiceStartNotAllowedException on Android 12+.
+        main.post {
+            runCatching { start(pendingEnv, pendingPhoneStorage, null, pendingVisualReplies) }
+                .onFailure { log("[dsh-app] could not replay start: ${it.message}", "system") }
+        }
+    }
+
+    /**
+     * Idle stop from DshService: nothing is running and nobody is looking, so the engine goes
+     * away and the CPU can sleep. Refuses unless the run is RUNNING and still ours.
+     */
+    internal fun stopForIdle(): Boolean {
+        val gen = synchronized(this) {
+            if (phase != Phase.RUNNING || resetting) return false
+            runGen
+        }
+        note("[dsh-app] idle stop: no activity, stopping the engine")
+        return stopProcess(gen)
+    }
+
     fun stop() {
-        synchronized(this) { phoneSkillStoppedGeneration = maxOf(phoneSkillStoppedGeneration, runGen) }
+        synchronized(this) {
+            pendingRestart = false
+            phoneSkillStoppedGeneration = maxOf(phoneSkillStoppedGeneration, runGen)
+        }
         managedSkillGate.stop(runGen)
         val intent = Intent(app, DshService::class.java).setAction(DshService.ACTION_STOP)
         app.startService(intent)
@@ -1098,6 +1138,10 @@ class RuntimeController private constructor(private val app: Context) : DshProce
         phase = next
         emitStatus()
         DshService.updateNotification(app)
+        // Any phase change is a sign of life for the idle timer.
+        DshService.touch()
+        // The stop finished: a start that arrived meanwhile may go ahead now.
+        if (next == Phase.INSTALLED) replayPendingStart()
     }
 
     private fun emitStatus() = synchronized(statusPublishLock) {

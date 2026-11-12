@@ -77,6 +77,15 @@ class RuntimePlugin :
                 val manual = call.argument<Any?>("manual") == true
                 result.success(if (markdown == null || markdown.length > 256 * 1024) null else controller.publishDiagnostics(markdown, manual = manual))
             }
+            "turnState" -> {
+                // State/turn_signals_state.dart: how many conversations stream right now.
+                TurnSignals.available = call.argument<Boolean>("available") == true
+                TurnSignals.activeTurns = (call.argument<Number>("activeTurns") ?: 0).toInt().coerceAtLeast(0)
+                TurnSignals.settled = call.argument<Boolean>("settled") == true
+                TurnSignals.pendingWait = call.argument<Boolean>("pendingWait") == true
+                TurnSignals.lastReportMs = System.currentTimeMillis()
+                result.success(null)
+            }
             "installManagedSkill" -> {
                 val owner = managedSkillOwner
                 if (owner == null) result.success(mapOf("result" to null, "current" to false, "reason" to "stale"))
